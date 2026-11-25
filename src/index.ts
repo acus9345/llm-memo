@@ -95,7 +95,9 @@ export class LLMCache {
 
   /** The cache key for a request: sha256 of its canonical JSON. Key order doesn't matter. */
   key(request: unknown): string {
-    const canonical = stableStringify({ ns: this.#namespace ?? null, request }, this.#ignore);
+    const ns = JSON.stringify(this.#namespace ?? null);
+    const req = canonicalize(request, this.#ignore);
+    const canonical = req === undefined ? `{"ns":${ns}}` : `{"ns":${ns},"request":${JSON.stringify(req)}}`;
     return createHash("sha256").update(canonical).digest("hex");
   }
 
@@ -113,7 +115,7 @@ export class LLMCache {
       const entry = await this.#read(key);
       if (entry) {
         this.#stats.hits++;
-        return (entry.chunks ? replay(entry.chunks.map(revive)) : revive(entry.response)) as T;
+        return (entry.chunks ? replay(entry.chunks.map((c) => revive(c))) : revive(entry.response)) as T;
       }
     }
     this.#stats.misses++;
@@ -167,8 +169,12 @@ export class LLMCache {
 
   async #read(key: string): Promise<Entry | undefined> {
     const entry = await this.store.get(key);
-    if (!entry) return undefined;
-    if (this.#ttl !== undefined && Date.now() - Date.parse(entry.createdAt) > this.#ttl) return undefined;
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return undefined;
+    if (!("response" in entry) && !Array.isArray(entry.chunks)) return undefined;
+    if (this.#ttl !== undefined) {
+      const createdAt = Date.parse(entry.createdAt);
+      if (Number.isNaN(createdAt) || Date.now() - createdAt >= this.#ttl) return undefined;
+    }
     return entry;
   }
 
@@ -282,6 +288,10 @@ export function parseTtl(ttl: number | string): number {
  * other than Date reduced to their `toJSON()` or their class name (an `AbortSignal` doesn't change the key).
  */
 export function stableStringify(value: unknown, ignore: ReadonlySet<string> = new Set()): string {
+  return JSON.stringify(canonicalize(value, ignore)) ?? "null";
+}
+
+function canonicalize(value: unknown, ignore: ReadonlySet<string>): unknown {
   const seen = new WeakSet<object>();
   const walk = (v: unknown): unknown => {
     if (v === null || typeof v === "string" || typeof v === "boolean") return v;
@@ -292,17 +302,21 @@ export function stableStringify(value: unknown, ignore: ReadonlySet<string> = ne
     seen.add(v);
     try {
       if (Array.isArray(v)) return v.map((x) => walk(x) ?? null);
-      if (v instanceof Date) return v.toISOString();
+      if (v instanceof Date) return Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
       if (ArrayBuffer.isView(v)) return Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString("base64");
       const proto = Object.getPrototypeOf(v) as object | null;
-      if (proto !== Object.prototype && proto !== null) {
+      const isPlain =
+        proto === Object.prototype ||
+        proto === null ||
+        (proto.constructor?.name === "Object" && Object.getPrototypeOf(proto) === null);
+      if (!isPlain) {
         const toJSON = (v as { toJSON?: unknown }).toJSON;
         if (typeof toJSON === "function") return walk(toJSON.call(v));
         if (v instanceof Map) return walk(Object.fromEntries(v));
         if (v instanceof Set) return walk([...v]);
         return `[${proto.constructor?.name ?? "Object"}]`;
       }
-      const out: Record<string, unknown> = {};
+      const out = Object.create(null) as Record<string, unknown>;
       for (const k of Object.keys(v).sort()) {
         if (ignore.has(k)) continue;
         const w = walk((v as Record<string, unknown>)[k]);
@@ -313,12 +327,40 @@ export function stableStringify(value: unknown, ignore: ReadonlySet<string> = ne
       seen.delete(v);
     }
   };
-  return JSON.stringify(walk(value)) ?? "null";
+  return walk(value);
 }
 
 function toJson(value: unknown): unknown {
-  const text = JSON.stringify(value, (_k, v: unknown) => (typeof v === "bigint" ? v.toString() : v));
-  return text === undefined ? null : JSON.parse(text);
+  try {
+    const text = JSON.stringify(value, (_k, v: unknown) => (typeof v === "bigint" ? v.toString() : v));
+    return text === undefined ? null : JSON.parse(text);
+  } catch {
+    return decycle(value) ?? null;
+  }
+}
+
+function decycle(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value !== "object") return undefined;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  try {
+    const toJSON = (value as { toJSON?: unknown }).toJSON;
+    if (typeof toJSON === "function") return decycle(toJSON.call(value), seen);
+    if (Array.isArray(value)) return value.map((v) => decycle(v, seen) ?? null);
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value)) {
+      const v = decycle((value as Record<string, unknown>)[k], seen);
+      if (v !== undefined) {
+        Object.defineProperty(out, k, { value: v, enumerable: true, configurable: true, writable: true });
+      }
+    }
+    return out;
+  } finally {
+    seen.delete(value);
+  }
 }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {

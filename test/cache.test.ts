@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
+import { runInNewContext } from "node:vm";
 import {
   CacheMissError,
   cachedClient,
   createCache,
+  diskStore,
   memoryStore,
   parseTtl,
   stableStringify,
@@ -200,13 +202,41 @@ describe("createCache", () => {
     assert.deepEqual(entry.response, { answer: 42 });
     assert.match(entry.createdAt, /^\d{4}-\d\d-\d\dT/);
 
-    const { writeFileSync } = await import("node:fs");
     writeFileSync(file, "{ truncated");
     let calls = 0;
     assert.deepEqual(await createCache({ dir }).call({ prompt: "p" }, () => (calls++, { answer: 43 })), { answer: 43 });
     assert.equal(calls, 1);
+
+    // Valid JSON that is not a valid entry (missing response/chunks) is also treated as a miss.
+    writeFileSync(file, "{}");
+    assert.deepEqual(await createCache({ dir }).call({ prompt: "p" }, () => (calls++, { answer: 44 })), { answer: 44 });
+    assert.equal(calls, 2);
+
     await cache.clear();
     assert.equal(existsSync(dir), false);
+  });
+
+  it("ignores empty or whitespace LLM_MEMO_DIR", async () => {
+    const prevDir = process.env.LLM_MEMO_DIR;
+    const prevCwd = process.cwd();
+    const workDir = freshDir();
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(workDir, { recursive: true });
+    process.chdir(workDir);
+    process.env.LLM_MEMO_DIR = "   ";
+    try {
+      const store = diskStore();
+      const key = "a".repeat(64);
+      await store.set(key, { key, createdAt: new Date().toISOString(), response: 1 });
+      assert.equal(existsSync(join(workDir, ".llm-cache", "aa", `${key}.json`)), true);
+      await store.clear();
+      assert.equal(existsSync(workDir), true);
+      assert.equal(existsSync(join(workDir, ".llm-cache")), false);
+    } finally {
+      process.chdir(prevCwd);
+      if (prevDir === undefined) delete process.env.LLM_MEMO_DIR;
+      else process.env.LLM_MEMO_DIR = prevDir;
+    }
   });
 
   it("storeRequest: false keeps prompts out of the cache files", async () => {
@@ -215,6 +245,66 @@ describe("createCache", () => {
     const entry = await cache.store.get(cache.key({ secret: "prompt" }));
     assert.equal(entry?.request, undefined);
     assert.equal(entry?.response, 1);
+  });
+
+  it("handles ignoreKeys named 'request' or 'ns' without colliding", () => {
+    const a = createCache({ store: "memory", namespace: "ns1", ignoreKeys: ["request", "ns"] });
+    const b = createCache({ store: "memory", namespace: "ns2", ignoreKeys: ["request", "ns"] });
+    assert.notEqual(a.key({ prompt: "one", request: "r1" }), a.key({ prompt: "two", request: "r2" }));
+    assert.notEqual(a.key({ prompt: "one" }), b.key({ prompt: "one" }));
+  });
+
+  it("handles circular requests when writing to cache", async () => {
+    const cache = createCache({ store: memoryStore() });
+    const req: Record<string, unknown> = { prompt: "hello" };
+    req.self = req;
+    let calls = 0;
+    assert.equal(await cache.call(req, () => ++calls), 1);
+    assert.equal(await cache.call(req, () => ++calls), 1);
+    const stored = await cache.store.get(cache.key(req));
+    assert.deepEqual(stored?.request, { prompt: "hello", self: "[Circular]" });
+  });
+
+  it("treats ttl: 0 and invalid createdAt as expired", async () => {
+    const store = memoryStore();
+    const zeroCache = createCache({ store, ttl: 0 });
+    let calls = 0;
+    await zeroCache.call("k", () => ++calls);
+    await zeroCache.call("k", () => ++calls);
+    assert.equal(calls, 2);
+
+    const ttlCache = createCache({ store, ttl: "1h" });
+    const key = ttlCache.key("bad-date");
+    await store.set(key, { key, createdAt: "not-a-date", response: "stale" });
+    assert.equal(await ttlCache.call("bad-date", () => "fresh"), "fresh");
+  });
+
+  it("handles concurrent diskStore reads and writes to the same key", async () => {
+    const store = diskStore({ dir: freshDir() });
+    const key = "b".repeat(64);
+    await Promise.all(
+      Array.from({ length: 50 }, (_, i) =>
+        i % 2 === 0 ? store.set(key, { key, createdAt: new Date().toISOString(), response: i }) : store.get(key),
+      ),
+    );
+    const final = await store.get(key);
+    assert.equal(typeof final?.response, "number");
+  });
+
+  it("does not leak map index into stream revive callback", async () => {
+    const client = cachedClient(new FakeClient(), {
+      store: "memory",
+      revive: (chunk, ...rest: unknown[]) => {
+        assert.equal(rest.length, 0);
+        return chunk;
+      },
+    });
+    for await (const _ of (await client.chat.completions.create(params("rev", { stream: true }))) as AsyncIterable<unknown>) {
+      // record
+    }
+    for await (const _ of (await client.chat.completions.create(params("rev", { stream: true }))) as AsyncIterable<unknown>) {
+      // replay
+    }
   });
 });
 
@@ -232,6 +322,11 @@ describe("helpers", () => {
     const circular: Record<string, unknown> = { x: 1 };
     circular.self = circular;
     assert.equal(stableStringify(circular), '{"self":"[Circular]","x":1}');
-    assert.equal(stableStringify({ d: new Date(0), n: 10n, s: new AbortController().signal }), '{"d":"1970-01-01T00:00:00.000Z","n":"10n","s":"[AbortSignal]"}');
+    assert.equal(
+      stableStringify({ d: new Date(0), bad: new Date("invalid"), n: 10n, s: new AbortController().signal }),
+      '{"bad":"Invalid Date","d":"1970-01-01T00:00:00.000Z","n":"10n","s":"[AbortSignal]"}',
+    );
+    assert.equal(stableStringify(JSON.parse('{"__proto__":{"a":1},"b":2}')), '{"__proto__":{"a":1},"b":2}');
+    assert.equal(stableStringify(runInNewContext("({ b: 1, a: 2 })")), '{"a":2,"b":1}');
   });
 });

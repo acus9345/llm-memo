@@ -1,6 +1,14 @@
 import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
+const RETRYABLE_RENAME = new Set(["EPERM", "EACCES", "EBUSY"]);
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function isEntry(value: unknown): value is Entry {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return "response" in value || Array.isArray((value as Entry).chunks);
+}
+
 /** One cached call. */
 export interface Entry {
   /** The cache key (sha256 hex). */
@@ -65,7 +73,8 @@ export interface DiskStoreOptions {
  * Commit the folder to replay recorded responses in CI without API keys.
  */
 export function diskStore(options: DiskStoreOptions = {}): Store {
-  const dir = resolve(options.dir ?? process.env.LLM_MEMO_DIR ?? ".llm-cache");
+  const rawDir = options.dir?.trim() ? options.dir : process.env.LLM_MEMO_DIR?.trim() ? process.env.LLM_MEMO_DIR : ".llm-cache";
+  const dir = resolve(rawDir);
   const pathFor = (key: string) => join(dir, key.slice(0, 2), `${key}.json`);
   return {
     async get(key) {
@@ -77,7 +86,9 @@ export function diskStore(options: DiskStoreOptions = {}): Store {
         throw error;
       }
       try {
-        return JSON.parse(text) as Entry;
+        const parsed = JSON.parse(text) as unknown;
+        if (!isEntry(parsed)) return undefined;
+        return parsed;
       } catch {
         // A truncated or hand-edited file is treated as a miss and rewritten.
         return undefined;
@@ -90,7 +101,17 @@ export function diskStore(options: DiskStoreOptions = {}): Store {
       const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
       await writeFile(tmp, `${JSON.stringify(entry, null, 2)}\n`);
       try {
-        await rename(tmp, path);
+        // Windows can return transient EPERM/EACCES/EBUSY when concurrent readers/writers race on rename.
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await rename(tmp, path);
+            break;
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (!code || !RETRYABLE_RENAME.has(code) || attempt >= 5) throw error;
+            await sleep(10 * 2 ** attempt);
+          }
+        }
       } catch (error) {
         await unlink(tmp).catch(() => {});
         throw error;
