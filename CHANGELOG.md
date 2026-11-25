@@ -1,6 +1,11 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this project are documented here. This project follows [Semantic Versioning](https://semver.org/).
+
+## [0.1.1] - 2026-11-25
+
+### Fixed
+- Fix Windows rename EPERM retries, ignoreKeys wrapper stripping, ttl:0 expiry, cycle-safe JSON serialization, and stableStringify edge cases.
 
 ## [0.1.0] - 2026-10-18
 

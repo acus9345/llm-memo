@@ -1,6 +1,6 @@
 {
   "name": "llm-memo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cache LLM API calls by request hash, on disk or in memory, so tests and dev loops stop paying for repeat calls. Works with the OpenAI, Anthropic and Gemini SDKs, including streams. Zero dependencies.",
   "keywords": [
     "llm",
